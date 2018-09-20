@@ -1,0 +1,163 @@
+# Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: 2010-09-09
+
+Description:  "Detective Control for: Security Group Rules that contain a CIDR of /0 (Both IPv4 and IPv6) (RCS-948)"
+
+####
+#### CloudFormation Metadata - makes the parameter inputs look nice
+####
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: SNS Settings
+      Parameters:
+      - pSNSEmailAddress
+    - Label:
+        default: Lambda Settings
+      Parameters:
+      - pLoggingLevel
+      - pLambdaFunctionsS3BucketName
+      - pLambdaFunctionS3keyPath
+    ParameterLabels:
+      pSNSEmailAddress:
+        default: SNS Subscription Email Address
+      pLoggingLevel:
+        default: Lambda Function Logging Level.
+      pLambdaFunctionsS3BucketName:
+        default: S3 Bucket with Lambda Function Zip files
+      pLambdaFunctionS3keyPath:
+        default: Path in the S3 Bucket to the Lambda Function zip file.
+
+Parameters:
+  pSNSEmailAddress: #Email address to be subscribed to the new SNS topic
+    Type: String
+    Description: Email address to notify in the case of a violation
+    Default: example@example.com
+  pLoggingLevel: # Lambda Logging level, Select "INFO", "WARNING", "ERROR"
+    Type: String
+    Description: Select "INFO", "WARNING", "ERROR"
+    Default: ERROR
+    AllowedValues:
+    - INFO
+    - WARNING
+    - ERROR
+  pLambdaFunctionsS3BucketName:
+    Type: String
+    Description: The name of the bucket used to store the lambda functions
+  pLambdaFunctionS3keyPath:
+    Type: String
+    Description: Path to the Lambda Function zip file.
+
+Resources:
+  rSNSCreateSNSTopic: #SNS Topic Creation and Subscription of a single Email address
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint: !Ref 'pSNSEmailAddress'
+        Protocol: email
+
+  rCloudWatchEvent: #CloudWatch Event Rule to trigger the Lambda Function
+    Type: AWS::Events::Rule
+    DependsOn: rLambdaFunction
+    Properties:
+      EventPattern:
+            source:
+              - aws.ec2
+            detail:
+              eventSource:
+                - ec2.amazonaws.com
+              eventName:
+                - AuthorizeSecurityGroupIngress
+      Name: !Sub ${AWS::StackName}-${AWS::Region}-Sec-Grp-Rules-CW-Event'
+      Targets:
+      - Arn: !GetAtt 'rLambdaFunction.Arn'
+        Id: rLambdaFunction
+
+  rCloudWatchEventLambdaPermission: #Allows CloudWatch Event to Invoke the rLambdaFunction function
+    Type: AWS::Lambda::Permission
+    DependsOn: rLambdaFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt 'rLambdaFunction.Arn'
+      Principal: events.amazonaws.com
+
+  rLambdaRole: #Lambda Execution Role and Permissions
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-Sec-Grp-Rules-LambdaRole'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+      - PolicyName: !Sub '${AWS::StackName}-${AWS::Region}-Sec-Grp-Rules-LambdaPolicy'
+        PolicyDocument:
+          Statement:
+          - Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Effect: Allow
+            Resource: "arn:aws:logs:*:*:*"
+            Sid: CloudWatchLogsPermissions
+          - Action:
+              - "sns:Publish"
+            Effect: Allow
+            Resource:
+              !Ref rSNSCreateSNSTopic
+            Sid: LambdaFunctionPermissionsforSNSPublish
+          - Action:
+              - 's3:ListBucket'
+              - 's3:ListBucketVersions'
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Effect: Allow
+            Resource:
+              - !Sub "arn:aws:s3:::${pLambdaFunctionsS3BucketName}*"
+              - !Sub "arn:aws:s3:::${pLambdaFunctionsS3BucketName}*/*"
+            Sid: S3BucketPermissions
+
+  rLambdaFunction: #Lambda Function Creation and Code
+    Type: AWS::Lambda::Function
+    DependsOn: rLambdaRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-${AWS::Region}-Sec-Grp-Rules-LambdaFunction'
+      Role: !GetAtt rLambdaRole.Arn
+      Description: Checking for any Security Group with a Source of 0.0.0.0/0 or ::/0
+      Environment:
+        Variables:
+          outbound_topic_arn: !Ref rSNSCreateSNSTopic
+          logging_level: !Ref pLoggingLevel
+      Handler: index.lambda_handler
+      Timeout: 60
+      Runtime: python3.6
+      Tags:
+      - Key: Name
+        Value: !Sub Lambda Security Control - ${AWS::StackName}
+      Code:
+        S3Bucket: !Ref pLambdaFunctionsS3BucketName
+        S3Key: !Ref pLambdaFunctionS3keyPath
+
+Outputs:
+  oLambdaFunctionARN:
+    Description: Lambda Function ARN
+    Value: !GetAtt rLambdaFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaARN
+  oSNSTopicARN:
+    Description: SNS topic ARN
+    Value: !Ref rSNSCreateSNSTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-SNSARN
+  oSNSSubscriber:
+    Description: SNS Subscriber Email Address
+    Value: !Ref pSNSEmailAddress
+    Export:
+      Name: !Sub ${AWS::StackName}-NotificationEmail
