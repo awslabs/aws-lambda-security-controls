@@ -1,0 +1,130 @@
+# Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda function to enable S3 Encryption AES-256 by default (RCS-1280)
+###
+### CloudFormation Interface Metadata
+###
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Lambda Configuration
+        Parameters:
+          - pLambdaZipBucket
+          - pLambdaZipKey
+      - Label:
+          default: Cloudtrail Logging Options
+        Parameters:
+          - pLoggingLevel
+    ParameterLabels:
+      pLambdaZipBucket:
+        default: S3 Bucket
+      pLambdaZipKey:
+        default: S3 Key
+      pLoggingLevel:
+        default: Cloudtrail Logging Level
+#### Template input parameters
+####
+Parameters:
+  pLambdaZipBucket:
+      Type: String
+      AllowedPattern: ^[a-zA-Z0-9-\-_.]{3,63}
+      Description: Name of the Lambda zip bucket
+  pLambdaZipKey:
+      Type: String
+      AllowedPattern: ^.+\.zip$
+      Description: The zip file key with the Lambda function
+  pLoggingLevel:
+      Type: String
+      Default: ERROR
+      Description: Sets the logging level of your security control's Lambda function.
+      AllowedValues:
+      - ERROR
+      - WARNING
+      - INFO
+####
+#### Template Resources
+####
+Resources:
+  #Lambda role with Cloudwatch and S3 permissions
+  rLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LambdaRole'
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-LambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Sid: S3Permissions
+                Effect: Allow
+                Action:
+                  - s3:PutEncryptionConfiguration
+                Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  # S3 bucket encryption evaluation function
+  rLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: rLambdaRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-LambdaFunction'
+      Role: !GetAtt 'rLambdaRole.Arn'
+      Environment:
+        Variables:
+          logging_level: !Ref 'pLoggingLevel'
+      Handler: index.lambda_handler
+      Timeout: 60
+      Runtime: python3.6
+      Code:
+        S3Bucket: !Ref 'pLambdaZipBucket'
+        S3Key: !Ref 'pLambdaZipKey'
+      Tags:
+        -
+          Key: "Lambda Function Name"
+          Value: !Sub '${AWS::StackName}-LambdaFunction'
+  # Event rule to trigger evaluation
+  rConfigEventRule:
+    Type: AWS::Events::Rule
+    DependsOn: rLambdaFunction
+    Properties:
+      EventPattern:
+          detail:
+              eventSource:
+                  - s3.amazonaws.com
+              eventName:
+                  - CreateBucket
+      Name:
+        Fn::Sub: ${AWS::StackName}-S3EncryptionRule
+      State: ENABLED
+      Targets:
+      - Arn:
+            Fn::GetAtt:
+                - "rLambdaFunction"
+                - "Arn"
+        Id: rLambdaFunction
+    # Allows CloudWatch Event to Invoke the rLambdaFunction function
+  # Allows CloudWatch Event to Invoke the rLambdaFunction function
+  rCloudWatchEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: rLambdaFunction
+    Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt 'rLambdaFunction.Arn'
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt rConfigEventRule.Arn

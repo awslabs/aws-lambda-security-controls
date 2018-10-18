@@ -1,0 +1,148 @@
+# Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Control: Check if S3 Object is encrypted with KMS and/or not using Customer Encryption Algorithm (RCS-1063)'
+
+###
+### CloudFormation Interface Metadata
+###
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Security Control Setup
+      Parameters:
+      - pLambdaZipBucket
+      - pLambdaZipKey
+      - pNotificationEmail
+    - Label:
+        default: Security Control Options
+      Parameters:
+      - pLoggingLevel
+    ParameterLabels:
+      pLambdaZipBucket:
+        default: S3 Bucket
+      pLambdaZipKey:
+        default: S3 Key
+      pNotificationEmail:
+        default: Notification email
+      pLoggingLevel:
+        default: Lambda Logging level
+
+###
+### Template input parameters
+###
+
+Parameters:
+  pLambdaZipBucket:
+    Type: String
+    Description: Name of the Security Control zip bucket
+  pLambdaZipKey:
+    Type: String
+    Description: The Security Control zip file key (e.g. functions/security-control.zip)
+  pLoggingLevel:
+    Type: String
+    Default: ERROR
+    Description: Sets the logging level of your security control's Lambda function.
+    AllowedValues:
+    - ERROR
+    - WARNING
+    - INFO
+  pNotificationEmail:
+    Type: String
+    Default: example@example.com
+    Description: Email address to alert of any security control violations
+
+###
+### Template Resources
+###
+
+Resources:
+
+  # Security Control IAM Role
+  rLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LambdaRole'
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-LambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Sid: LambdaFunctionPermissionsforSNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref 'rNotifyTopicSNS'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  # Security Control evaluation function
+  rLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: rLambdaRole
+    Properties:
+      Role: !GetAtt 'rLambdaRole.Arn'
+      FunctionName: !Sub '${AWS::StackName}-LambdaFunction'
+      Runtime: python3.6
+      Timeout: 60
+      Environment:
+        Variables:
+          outbound_topic_arn: !Ref 'rNotifyTopicSNS'
+          logging_level: !Ref 'pLoggingLevel'
+      Handler: index.lambda_handler
+      Code:
+        S3Bucket: !Ref pLambdaZipBucket
+        S3Key: !Ref pLambdaZipKey
+
+  # Event rule to trigger evaluation
+  rConfigEventRule:
+    Type: AWS::Events::Rule
+    DependsOn: rLambdaFunction
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+          - s3.amazonaws.com
+          eventName:
+          - PutObject
+          - CopyObject
+      Targets:
+        - Arn: !GetAtt 'rLambdaFunction.Arn'
+          Id: rLambdaFunction
+
+  # Lambda permission - event rule can trigger evaluation
+  rLaunchConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: rLambdaFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt 'rLambdaFunction.Arn'
+      Principal: events.amazonaws.com
+
+  # Notification SNS topic
+  rNotifyTopicSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref pNotificationEmail
+          Protocol: email
